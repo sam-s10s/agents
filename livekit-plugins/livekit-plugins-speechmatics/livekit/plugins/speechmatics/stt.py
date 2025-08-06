@@ -53,7 +53,7 @@ from .types import (
     DiarizationFocusMode,
     DiarizationKnownSpeaker,
     EndOfUtteranceMode,
-    SpeakerFragments,
+    SpeakerFrame,
     SpeechFragment,
 )
 from .utils import get_endpoint_url
@@ -322,6 +322,8 @@ class SpeechStream(stt.RecognizeStream):
 
         # Current utterance speech data
         self._speech_fragments: list[SpeechFragment] = []
+        self._speaker_frames: list[SpeakerFrame] = []
+        self._trim_before_time: float = 0.0
 
         # EndOfUtterance fallback timer
         self._end_of_utterance_timer: asyncio.Task | None = None
@@ -438,8 +440,12 @@ class SpeechStream(stt.RecognizeStream):
         if not has_changed:
             return
 
+        # Get speech frames (InterimTranscriptionFrame)
+        self._speaker_frames = self._get_frames_from_fragments()
+
         # Set a timer for the end of utterance
-        self._end_of_utterance_timer_start()
+        if not all(frame.is_final for frame in self._speaker_frames if frame.is_active):
+            self._end_of_utterance_timer_start()
 
         # Send frames
         asyncio.create_task(self._send_frames())
@@ -484,7 +490,7 @@ class SpeechStream(stt.RecognizeStream):
             self._end_of_utterance_timer.cancel()
             self._end_of_utterance_timer = None
 
-    async def _send_frames(self, finalized: bool = False) -> None:
+    async def _send_frames(self, finalized: bool = False, flush: bool = False) -> None:
         """Send frames to the pipeline.
 
         Send speech frames to the pipeline. If VAD is enabled, then this will
@@ -492,19 +498,51 @@ class SpeechStream(stt.RecognizeStream):
         final transcript is received, then this will send a user stopped speaking
         and stop interruption frames.
 
+        If you set flush to True, then this will emit the frames regardless of
+        whether they are for an active speaker not. This can be useful if you wish
+        to periodically send background speech to an LLM for context and decision
+        making purposes.
+
         Args:
             finalized: Whether the data is final or partial.
+            flush: Whether to flush the frames regardless of speaker.
         """
-        # Get speech frames (InterimTranscriptionFrame)
-        speech_frames = self._get_frames_from_fragments()
 
         # Skip if no frames
-        if not speech_frames:
+        if not self._speaker_frames:
             return
 
         # Check at least one frame is active
-        if not any(frame.is_active for frame in speech_frames):
+        if not flush and not any(frame.is_active for frame in self._speaker_frames):
             return
+
+        # - NOTE -
+        # We need to work out how much of the transcript can be rushed through to the LLM.
+        # For example, if we are locking onto a speaker, once they have finished and even
+        # if someone else is speaking, we should finalize their words through.
+
+        # Find the index of the last active frame
+        last_active_frame_index = max(
+            range(len(self._speaker_frames)),
+            key=lambda i: self._speaker_frames[i].is_active,
+        )
+
+        # Trim back to the last finalised frame
+        ready_frames: list[SpeakerFrame] = (
+            self._speaker_frames
+            if flush
+            else self._speaker_frames[: last_active_frame_index + 1] or []
+        )
+
+        # Find the time of the last valid fragment to then use for trimming if we are finalizing
+        trim_time = ready_frames[-1].fragments[-1].end_time + 0.005
+
+        # Log
+        logger.warning(f"Last active frame index: {last_active_frame_index}")
+        logger.warning(
+            f"Ready frames: {[frame._format_text('{speaker_id} -> {text}') for frame in ready_frames]}"
+        )
+        logger.warning(f"Trim time: {trim_time}")
 
         # Event type to send
         if not finalized:
@@ -513,7 +551,7 @@ class SpeechStream(stt.RecognizeStream):
             event_type = stt.SpeechEventType.FINAL_TRANSCRIPT
 
         # Get the speech data and send
-        for item in speech_frames:
+        for item in self._speaker_frames:
             final_event = stt.SpeechEvent(
                 type=event_type,
                 alternatives=[
@@ -531,8 +569,13 @@ class SpeechStream(stt.RecognizeStream):
             # Send End of Speech
             self._event_ch.send_nowait(stt.SpeechEvent(type=stt.SpeechEventType.END_OF_SPEECH))
 
-            # Reset the data
-            self._speech_fragments.clear()
+            # Update the trim time
+            self._trim_time = trim_time
+
+            # Remove fragments prior to the trim time
+            self._speech_fragments = [
+                frag for frag in self._speech_fragments if frag.end_time >= self._trim_time
+            ]
 
             # Send the recognition usage event
             if self._speech_duration > 0:
@@ -585,6 +628,10 @@ class SpeechStream(stt.RecognizeStream):
                     result=result,
                 )
 
+                # Check this fragment is after the trim point
+                if fragment.start_time <= self._trim_before_time:
+                    continue
+
                 # Speaker filtering
                 if fragment.speaker:
                     # Drop `__XX__` speakers
@@ -609,6 +656,12 @@ class SpeechStream(stt.RecognizeStream):
                 # Add the fragment
                 fragments.append(fragment)
 
+        # Always retain the final fragment, if an eos
+        # final_eos_fragment = self._speech_fragments[-1] if self._speech_fragments else None
+        # if final_eos_fragment and final_eos_fragment.is_eos:
+        #     fragments.append(final_eos_fragment)
+        #     logger.warning(f"Final fragment: {final_eos_fragment}")
+
         # Remove existing partials, as new partials and finals are provided
         self._speech_fragments = [frag for frag in self._speech_fragments if frag.is_final]
 
@@ -619,20 +672,23 @@ class SpeechStream(stt.RecognizeStream):
         # Add the fragments to the speech data
         self._speech_fragments.extend(fragments)
 
+        # Re-sort fragments
+        self._speech_fragments.sort(key=lambda frag: frag.start_time)
+
         # Data was updated
         return True
 
-    def _get_frames_from_fragments(self) -> list[SpeakerFragments]:
+    def _get_frames_from_fragments(self) -> list[SpeakerFrame]:
         """Get speech data objects for the current fragment list.
 
         Each speech fragments is grouped by contiguous speaker and then
-        returned as internal SpeakerFragments objects with the `speaker_id` field
+        returned as internal SpeakerFrame objects with the `speaker_id` field
         set to the current speaker (string). An utterance may contain speech from
         more than one speaker (e.g. S1, S2, S1, S3, ...), so they are kept
         in strict order for the context of the conversation.
 
         Returns:
-            List[SpeakerFragments]: The list of objects.
+            List[SpeakerFrame]: The list of objects.
         """
         # Speaker groups
         current_speaker: str | None = None
@@ -646,21 +702,21 @@ class SpeechStream(stt.RecognizeStream):
                     speaker_groups.append([])
             speaker_groups[-1].append(frag)
 
-        # Create SpeakerFragments objects
-        speaker_fragments: list[SpeakerFragments] = []
+        # Create SpeakerFrame objects
+        speaker_fragments: list[SpeakerFrame] = []
         for group in speaker_groups:
-            sd = self._get_speaker_fragments_from_fragment_group(group)
+            sd = self._get_speaker_frame_from_fragment_group(group)
             if sd:
                 speaker_fragments.append(sd)
 
-        # Return the grouped SpeakerFragments objects
+        # Return the grouped SpeakerFrame objects
         return speaker_fragments
 
-    def _get_speaker_fragments_from_fragment_group(
+    def _get_speaker_frame_from_fragment_group(
         self,
         group: list[SpeechFragment],
-    ) -> SpeakerFragments | None:
-        """Take a group of fragments and piece together into SpeakerFragments.
+    ) -> SpeakerFrame | None:
+        """Take a group of fragments and piece together into SpeakerFrame.
 
         Each fragment for a given speaker is assembled into a string,
         taking into consideration whether words are attached to the
@@ -673,7 +729,7 @@ class SpeechStream(stt.RecognizeStream):
             group: List of SpeechFragment objects.
 
         Returns:
-            SpeakerFragments: The object for the group.
+            SpeakerFrame: The object for the group.
         """
         # Check for starting fragments that are attached to previous
         if group and group[0].attaches_to == "previous":
@@ -700,13 +756,17 @@ class SpeechStream(stt.RecognizeStream):
         if self._stt._enable_diarization and self._stt._focus_speakers:
             is_active = group[0].speaker in self._stt._focus_speakers
 
-        # Return the SpeakerFragments object
-        return SpeakerFragments(
+        # Are all fragments finalised?
+        is_final = all(frag.is_final for frag in group)
+
+        # Return the SpeakerFrame object
+        return SpeakerFrame(
             speaker_id=group[0].speaker,
             timestamp=ts,
             language=group[0].language,
             fragments=group,
             is_active=is_active,
+            is_final=is_final,
         )
 
     async def aclose(self) -> None:

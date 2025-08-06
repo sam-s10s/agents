@@ -82,12 +82,13 @@ class SpeechFragment:
 
 
 @dataclass
-class SpeakerFragments:
-    """SpeechFragment items grouped by speaker_id.
+class SpeakerFrame:
+    """SpeakerFrame items grouped by speaker_id.
 
     Parameters:
         speaker_id: The ID of the speaker.
         is_active: Whether the speaker is active (emits frame).
+        is_final: Whether the speaker block is finalised.
         timestamp: The timestamp of the frame.
         language: The language of the frame.
         fragments: The list of SpeechFragment items.
@@ -95,13 +96,14 @@ class SpeakerFragments:
 
     speaker_id: str | None = None
     is_active: bool = False
+    is_final: bool = False
     timestamp: str | None = None
     language: str | None = None
     fragments: list[SpeechFragment] = field(default_factory=list)
 
     def __str__(self):
         """Return a string representation of the object."""
-        return f"SpeakerFragments(speaker_id: {self.speaker_id}, timestamp: {self.timestamp}, language: {self.language}, text: {self._format_text()})"
+        return f"SpeakerFrame(speaker_id: {self.speaker_id}, timestamp: {self.timestamp}, language: {self.language}, text: {self._format_text()})"
 
     def _format_text(self, format: str | None = None) -> str:
         """Wrap text with speaker ID in an optional f-string format.
@@ -125,7 +127,9 @@ class SpeakerFragments:
         # Format the text, if format is provided
         if format is None or self.speaker_id is None:
             return content
-        return format.format(**{"speaker_id": self.speaker_id, "text": content})
+        return format.format(
+            **{"speaker_id": self.speaker_id, "text": content, "ts": self.timestamp}
+        )
 
     def _as_speech_data_attributes(
         self, active_format: str | None = None, passive_format: str | None = None
