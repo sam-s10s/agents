@@ -516,11 +516,6 @@ class SpeechStream(stt.RecognizeStream):
         if not flush and not any(frame.is_active for frame in self._speaker_frames):
             return
 
-        # - NOTE -
-        # We need to work out how much of the transcript can be rushed through to the LLM.
-        # For example, if we are locking onto a speaker, once they have finished and even
-        # if someone else is speaking, we should finalize their words through.
-
         # Find the index of the last active frame
         last_active_frame_index = max(
             range(len(self._speaker_frames)),
@@ -537,13 +532,6 @@ class SpeechStream(stt.RecognizeStream):
         # Find the time of the last valid fragment to then use for trimming if we are finalizing
         trim_time = ready_frames[-1].fragments[-1].end_time + 0.005
 
-        # Log
-        logger.warning(f"Last active frame index: {last_active_frame_index}")
-        logger.warning(
-            f"Ready frames: {[frame._format_text('{speaker_id} -> {text}') for frame in ready_frames]}"
-        )
-        logger.warning(f"Trim time: {trim_time}")
-
         # Event type to send
         if not finalized:
             event_type = stt.SpeechEventType.INTERIM_TRANSCRIPT
@@ -551,7 +539,7 @@ class SpeechStream(stt.RecognizeStream):
             event_type = stt.SpeechEventType.FINAL_TRANSCRIPT
 
         # Get the speech data and send
-        for item in self._speaker_frames:
+        for item in ready_frames:
             final_event = stt.SpeechEvent(
                 type=event_type,
                 alternatives=[
