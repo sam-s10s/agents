@@ -58,6 +58,9 @@ from .types import (
 )
 from .utils import get_endpoint_url
 
+# Increase debugging messages (can be noisy!)
+DEBUG_MORE = os.getenv("SPEECHMATICS_DEBUG_MORE", "0").lower() in ["1", "true"]
+
 
 class STT(stt.STT):
     def __init__(
@@ -328,6 +331,22 @@ class SpeechStream(stt.RecognizeStream):
         # EndOfUtterance fallback timer
         self._end_of_utterance_timer: asyncio.Task | None = None
 
+        # End of utterance / fallback timer interval
+        self._end_of_utterance_mode: EndOfUtteranceMode = self._stt._end_of_utterance_mode
+        self._end_of_utterance_silence_trigger_interval: float | None = None
+
+        # for FIXED end of utterances (uses EndOfUtterance messages)
+        if self._end_of_utterance_mode == EndOfUtteranceMode.FIXED:
+            self._end_of_utterance_silence_trigger_interval: float = (
+                self._stt._end_of_utterance_silence_trigger * 1.5
+            )
+
+        # For ADAPTIVE end of utterances (uses word interval trigger)
+        elif self._end_of_utterance_mode == EndOfUtteranceMode.ADAPTIVE:
+            self._end_of_utterance_silence_trigger_interval: float = (
+                self._stt._end_of_utterance_silence_trigger
+            )
+
     async def _run(self) -> None:
         """Run the STT stream."""
 
@@ -338,12 +357,12 @@ class SpeechStream(stt.RecognizeStream):
         )
 
         # Log the event
-        logger.debug("Connected to Speechmatics STT service")
+        logger.debug("connected to Speechmatics STT service")
 
         # Recognition started event
         @self._client.on(ServerMessageType.RECOGNITION_STARTED)
         def _evt_on_recognition_started(message: dict[str, Any]):
-            logger.debug(f"Recognition started (session: {message.get('id')})")
+            logger.debug(f"recognition started (session: {message.get('id')})")
             self._start_time = datetime.datetime.now(datetime.timezone.utc)
 
         # Partial transcript event
@@ -363,7 +382,7 @@ class SpeechStream(stt.RecognizeStream):
 
             @self._client.on(ServerMessageType.END_OF_UTTERANCE)
             def _evt_on_end_of_utterance(message: dict[str, Any]):
-                logger.debug("End of utterance received from STT")
+                logger.debug("EndOfUtterance received from STT")
                 asyncio.create_task(self._handle_end_of_utterance())
 
         # Speaker Result
@@ -371,7 +390,7 @@ class SpeechStream(stt.RecognizeStream):
 
             @self._client.on(ServerMessageType.SPEAKERS_RESULT)
             def _evt_on_speakers_result(message: dict[str, Any]):
-                logger.debug("Speakers result received from STT")
+                logger.debug("SpeakersResult received from STT")
                 logger.debug(message)
 
         # Start session
@@ -416,7 +435,7 @@ class SpeechStream(stt.RecognizeStream):
         try:
             payload = {"message": message}
             payload.update(kwargs)
-            logger.debug(f"Sending message to STT: {payload}")
+            logger.debug(f"sending message to STT: {payload}")
             asyncio.run_coroutine_threadsafe(
                 self._client.send_message(payload), self.get_event_loop()
             )
@@ -468,13 +487,14 @@ class SpeechStream(stt.RecognizeStream):
         # Send after a delay
         async def send_after_delay(delay: float):
             await asyncio.sleep(delay)
-            logger.debug("Fallback EndOfUtterance triggered.")
+            logger.debug("EndOfUtterance timer trigger")
             asyncio.create_task(self._handle_end_of_utterance())
 
-        # Start the timer
-        self._end_of_utterance_timer = asyncio.create_task(
-            send_after_delay(self._stt._end_of_utterance_silence_trigger * 2)
-        )
+        # Start the fallback timer
+        if self._end_of_utterance_silence_trigger_interval is not None:
+            self._end_of_utterance_timer = asyncio.create_task(
+                send_after_delay(self._end_of_utterance_silence_trigger_interval)
+            )
 
     async def _handle_end_of_utterance(self):
         """Handle the end of utterance event.
@@ -512,6 +532,12 @@ class SpeechStream(stt.RecognizeStream):
         if not self._speaker_frames:
             return
 
+        # Debug what is in the buffer
+        if DEBUG_MORE:
+            logger.debug(
+                [f._format_text("{speaker_id}: {text}") for f in self._speaker_frames],
+            )
+
         # Check at least one frame is active
         if not flush and not any(frame.is_active for frame in self._speaker_frames):
             return
@@ -528,9 +554,6 @@ class SpeechStream(stt.RecognizeStream):
             if flush
             else self._speaker_frames[: last_active_frame_index + 1] or []
         )
-
-        # Find the time of the last valid fragment to then use for trimming if we are finalizing
-        trim_time = ready_frames[-1].fragments[-1].end_time + 0.005
 
         # Event type to send
         if not finalized:
@@ -558,7 +581,7 @@ class SpeechStream(stt.RecognizeStream):
             self._event_ch.send_nowait(stt.SpeechEvent(type=stt.SpeechEventType.END_OF_SPEECH))
 
             # Update the trim time
-            self._trim_time = trim_time
+            self._trim_time = ready_frames[-1].fragments[-1].end_time + 0.005
 
             # Remove fragments prior to the trim time
             self._speech_fragments = [
